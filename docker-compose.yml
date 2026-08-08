@@ -1,0 +1,10 @@
+services:
+  lang-probe:
+    build: .
+    container_name: nimetodex-lang-probe
+    restart: unless-stopped
+    environment:
+      # Nastav v Coolify jako environment variable, NE do gitu.
+      - TORBOX_API_KEY=${TORBOX_API_KEY}
+    # Žádné publikované porty — fáze 1 nic nevystavuje ven.
+    # Egress ven (api.torbox.app + CDN nody) jde defaultně.
