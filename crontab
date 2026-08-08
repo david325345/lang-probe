@@ -1,0 +1,10 @@
+# NimeToDex lang-probe — noční běh
+# Spustí se v 1:00 ráno, doběhne max 100 torrentů (~33 min při 20s rozestupu),
+# takže se pohodlně vejde do okna 1:00-6:00. Běží jednou za noc.
+# Env proměnné cron nevidí z kontejneru automaticky — entrypoint je uloží
+# do /app/env.sh, který si skript načte.
+#
+# min hod den měsíc den-v-týdnu  příkaz
+0 1 * * * root . /app/env.sh; /app/probe.sh --limit 100 >> /tmp/cron.log 2>&1
+# prázdný řádek na konci je povinný pro cron ↓
+
