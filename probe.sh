@@ -106,7 +106,7 @@ pick_file() {
   # jen video soubory (mkv/mp4/avi/webm)
   local vids
   vids=$(echo "$files" | jq -c '[.[] | select((.short_name // .name // "")
-          | ascii_downcase | test("\\.(mkv|mp4|avi|webm)$"))]')
+          | ascii_downcase | test("\\.(mkv|webm|mp4|mov|m4v|avi)$"))]')
   [ "$(echo "$vids" | jq 'length')" -gt 0 ] || { echo ""; return; }
 
   # 1) basename match
@@ -131,9 +131,9 @@ pick_file() {
   printf '%s\t%s' "$fid" "$mt"
 }
 
-# ---- Probe jednoho souboru: range download + mkvmerge -> jazyky ----
-# Vrací status na stdout: "ok|SUBS_CSV|AUDIO_CSV"  nebo  "empty|" nebo "error|"
-probe_langs() {
+# ---- Probe MKV/WebM: range download + mkvmerge -> jazyky ----
+# Vrací status na stdout: "ok|SUBS_CSV|AUDIO_CSV"  nebo  "empty|..." nebo "error||"
+probe_mkv() {
   local url="$1"
   curl -s -m 30 -r "0-$RANGE_BYTES" -o "$TMP" "$url" || { echo "error||"; return; }
 
@@ -151,9 +151,46 @@ probe_langs() {
   audio=$(echo "$j" | jq -r '[.tracks[] | select(.type=="audio")
           | (.properties.language_ietf // .properties.language // "und")] | unique | join(",")')
 
-  # empty = jen und / žádné jazyky
   local clean; clean=$(echo "$subs$audio" | tr -d ',und')
   if [ -z "$clean" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
+}
+
+# ---- Probe MP4/MOV: ffprobe čte přímo přes HTTP (bez lokálního stažení) ----
+# ffprobe si sám vezme přes range jen hlavičku; u MP4 s moov na konci udělá
+# 2 range requesty (začátek + konec), pořád levné. Jazyky z streams[].tags.language
+# (ISO 639-2, normalizace až ve fázi 3). Vrací stejný formát jako probe_mkv.
+probe_mp4() {
+  local url="$1"
+  local j
+  j=$(ffprobe -v quiet -print_format json -show_streams \
+        -analyzeduration 0 -probesize 2M "$url" 2>/dev/null)
+  [ -n "$j" ] || { echo "error||"; return; }
+
+  local subs audio
+  subs=$(echo "$j" | jq -r '[.streams[] | select(.codec_type=="subtitle")
+          | (.tags.language // "und")] | unique | join(",")')
+  audio=$(echo "$j" | jq -r '[.streams[] | select(.codec_type=="audio")
+          | (.tags.language // "und")] | unique | join(",")')
+
+  # ffprobe nevrátil žádný stream -> error (ne empty)
+  local nstreams; nstreams=$(echo "$j" | jq '.streams | length')
+  [ "$nstreams" -gt 0 ] 2>/dev/null || { echo "error||"; return; }
+
+  local clean; clean=$(echo "$subs$audio" | tr -d ',und')
+  if [ -z "$clean" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
+}
+
+# ---- Rozcestník podle přípony jména souboru ----
+# .mkv/.webm -> mkvmerge; .mp4/.mov -> ffprobe; ostatní sem nechodí (řeší se dřív)
+probe_langs() {
+  local url="$1" name="$2"
+  if echo "$name" | grep -qiE '\.(mkv|webm)$'; then
+    probe_mkv "$url"
+  elif echo "$name" | grep -qiE '\.(mp4|mov|m4v)$'; then
+    probe_mp4 "$url"
+  else
+    echo "error||"
+  fi
 }
 
 # =====================================================================
@@ -197,9 +234,10 @@ while [ "$processed" -lt "$LIMIT" ]; do
       processed=$((processed+1)); continue
     fi
 
-    # ne-MKV podle hintu (rychlý filtr — .avi/.mp4 mkvmerge neumí)
-    if echo "$hname" | grep -qiE '\.(avi|mp4|mov|wmv)$'; then
-      log "  #$id ne-MKV ($hname) — skip"
+    # Neprobovatelné formáty — .avi/.wmv nenesou per-stream jazyk,
+    # indexer je řeší z názvu. .mp4/.mov/.mkv/.webm jdou dál.
+    if echo "$hname" | grep -qiE '\.(avi|wmv|flv|mpg|mpeg|ts)$'; then
+      log "  #$id nonmkv ($hname) — indexer řeší z názvu, skip"
       emit "$id" "$hash" "nonmkv" "" "" "$hname"
       processed=$((processed+1)); continue
     fi
@@ -241,8 +279,8 @@ while [ "$processed" -lt "$LIMIT" ]; do
       processed=$((processed+1)); continue
     fi
 
-    # probe
-    res=$(probe_langs "$url")
+    # probe (rozcestník mkvmerge/ffprobe podle přípony)
+    res=$(probe_langs "$url" "$hname")
     st=$(printf '%s'    "$res" | cut -d'|' -f1)
     subs=$(printf '%s'  "$res" | cut -d'|' -f2)
     audio=$(printf '%s' "$res" | cut -d'|' -f3)

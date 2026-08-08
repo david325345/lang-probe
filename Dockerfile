@@ -1,7 +1,8 @@
 FROM debian:stable-slim
 
 # curl = range download z TorBox CDN
-# mkvtoolnix = mkvmerge -J (jazyky stop)
+# mkvtoolnix = mkvmerge -J (jazyky stop u MKV/WebM)
+# ffmpeg = ffprobe (jazyky u MP4/MOV, čte přímo přes HTTP)
 # jq = čisté parsování/generování JSON (čitelný výstup pro indexer)
 # cron = noční automatické spouštění
 # tzdata = časová zóna (aby cron běžel dle Prahy, ne UTC)
@@ -11,6 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
         mkvtoolnix \
+        ffmpeg \
         jq \
         cron \
         tzdata \
