@@ -98,7 +98,7 @@ tb_delete() {       # arg: torrent_id
 # ---- Výběr souboru z TorBox files[] podle indexer hintu ----
 # Priorita: 1) basename(short_name)==basename(hint) 2) přesná size
 #           3) size ±0.1% 4) první video soubor
-# Vrací: "<file_id>\t<mimetype>"  nebo prázdno když žádný video soubor
+# Vrací: "<file_id>\t<mimetype>\t<short_name>"  nebo prázdno když žádný video soubor
 pick_file() {
   local files="$1" hint_name="$2" hint_size="$3"
   local base_hint; base_hint=$(basename "$hint_name")
@@ -125,10 +125,12 @@ pick_file() {
   # 4) první video
   [ -z "$hit" ] && hit=$(echo "$vids" | jq -c '.[0]')
 
-  local fid mt
+  local fid mt sn
   fid=$(echo "$hit" | jq -r '.id')
   mt=$(echo "$hit"  | jq -r '.mimetype // ""')
-  printf '%s\t%s' "$fid" "$mt"
+  # reálné jméno souboru v TorBoxu (má vždy správnou příponu, na rozdíl od hintu)
+  sn=$(echo "$hit"  | jq -r '(.short_name // .name // "") | split("/") | last')
+  printf '%s\t%s\t%s' "$fid" "$mt" "$sn"
 }
 
 # ---- Probe MKV/WebM: range download + mkvmerge -> jazyky ----
@@ -180,16 +182,23 @@ probe_mp4() {
   if [ -z "$clean" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
 }
 
-# ---- Rozcestník podle přípony jména souboru ----
-# .mkv/.webm -> mkvmerge; .mp4/.mov -> ffprobe; ostatní sem nechodí (řeší se dřív)
+# ---- Rozcestník: podle přípony REÁLNÉHO jména (short_name z TorBoxu) ----
+# short_name má spolehlivou příponu (na rozdíl od hint jména z indexeru, které
+# někdy končí tagem/}). Když přípona chybí i tady, rozhodne mimetype; a když ani
+# ten ne, default = mkvmerge (anime je z ~95 % MKV, magic-check to stejně ověří).
 probe_langs() {
-  local url="$1" name="$2"
+  local url="$1" name="$2" mime="$3"
   if echo "$name" | grep -qiE '\.(mkv|webm)$'; then
     probe_mkv "$url"
   elif echo "$name" | grep -qiE '\.(mp4|mov|m4v)$'; then
     probe_mp4 "$url"
+  elif echo "$mime" | grep -qi 'matroska\|webm'; then
+    probe_mkv "$url"
+  elif echo "$mime" | grep -qi 'mp4\|quicktime'; then
+    probe_mp4 "$url"
   else
-    echo "error||"
+    # neznámá přípona i mimetype -> zkus mkvmerge (magic-check uvnitř ověří MKV)
+    probe_mkv "$url"
   fi
 }
 
@@ -261,6 +270,7 @@ while [ "$processed" -lt "$LIMIT" ]; do
     fi
     fid=$(printf '%s' "$picked" | cut -f1)
     mt=$(printf '%s'  "$picked" | cut -f2)
+    sname=$(printf '%s' "$picked" | cut -f3)   # reálné jméno z TorBoxu (spolehlivá přípona)
 
     # pojistka na zip mimetype
     if echo "$mt" | grep -qi 'zip'; then
@@ -279,8 +289,8 @@ while [ "$processed" -lt "$LIMIT" ]; do
       processed=$((processed+1)); continue
     fi
 
-    # probe (rozcestník mkvmerge/ffprobe podle přípony)
-    res=$(probe_langs "$url" "$hname")
+    # probe (rozcestník podle REÁLNÉHO jména z TorBoxu + mimetype)
+    res=$(probe_langs "$url" "$sname" "$mt")
     st=$(printf '%s'    "$res" | cut -d'|' -f1)
     subs=$(printf '%s'  "$res" | cut -d'|' -f2)
     audio=$(printf '%s' "$res" | cut -d'|' -f3)
