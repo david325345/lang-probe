@@ -59,6 +59,54 @@ emit() {
       name:$name, ts: (now|todate)}' >> "$OUT"
 }
 
+# ---- Normalizace jazykových kódů: ISO 639-2/B a /T -> 639-1 ----
+# Kompletní mapa z pycountry (204 kódů, všech 21 dvojitých B/T + zbytek).
+# Pořadí: 639-2/3 -> 639-1 přes mapu; regionální (es-419/pt-BR/zh-Hans) -> část
+# před pomlčkou; und/mul/mis/zxx zahodit; neznámý (není v mapě, není 2-písm)
+# nechat projít + zalogovat do UNKNOWN_LOG pro pozdější doladění.
+ISO_MAP='{"aar":"aa","abk":"ab","afr":"af","aka":"ak","alb":"sq","amh":"am","ara":"ar","arg":"an","arm":"hy","asm":"as","ava":"av","ave":"ae","aym":"ay","aze":"az","bak":"ba","bam":"bm","baq":"eu","bel":"be","ben":"bn","bis":"bi","bod":"bo","bos":"bs","bre":"br","bul":"bg","bur":"my","cat":"ca","ces":"cs","cha":"ch","che":"ce","chi":"zh","chu":"cu","chv":"cv","cor":"kw","cos":"co","cre":"cr","cym":"cy","cze":"cs","dan":"da","deu":"de","div":"dv","dut":"nl","dzo":"dz","ell":"el","eng":"en","epo":"eo","est":"et","eus":"eu","ewe":"ee","fao":"fo","fas":"fa","fij":"fj","fin":"fi","fra":"fr","fre":"fr","fry":"fy","ful":"ff","geo":"ka","ger":"de","gla":"gd","gle":"ga","glg":"gl","glv":"gv","gre":"el","grn":"gn","guj":"gu","hat":"ht","hau":"ha","hbs":"sh","heb":"he","her":"hz","hin":"hi","hmo":"ho","hrv":"hr","hun":"hu","hye":"hy","ibo":"ig","ice":"is","ido":"io","iii":"ii","iku":"iu","ile":"ie","ina":"ia","ind":"id","ipk":"ik","isl":"is","ita":"it","jav":"jv","jpn":"ja","kal":"kl","kan":"kn","kas":"ks","kat":"ka","kau":"kr","kaz":"kk","khm":"km","kik":"ki","kin":"rw","kir":"ky","kom":"kv","kon":"kg","kor":"ko","kua":"kj","kur":"ku","lao":"lo","lat":"la","lav":"lv","lim":"li","lin":"ln","lit":"lt","ltz":"lb","lub":"lu","lug":"lg","mac":"mk","mah":"mh","mal":"ml","mao":"mi","mar":"mr","may":"ms","mkd":"mk","mlg":"mg","mlt":"mt","mon":"mn","mri":"mi","msa":"ms","mya":"my","nau":"na","nav":"nv","nbl":"nr","nde":"nd","ndo":"ng","nep":"ne","nld":"nl","nno":"nn","nob":"nb","nor":"no","nya":"ny","oci":"oc","oji":"oj","ori":"or","orm":"om","oss":"os","pan":"pa","per":"fa","pli":"pi","pol":"pl","por":"pt","pus":"ps","que":"qu","roh":"rm","ron":"ro","rum":"ro","run":"rn","rus":"ru","sag":"sg","san":"sa","sin":"si","slk":"sk","slo":"sk","slv":"sl","sme":"se","smo":"sm","sna":"sn","snd":"sd","som":"so","sot":"st","spa":"es","sqi":"sq","srd":"sc","srp":"sr","ssw":"ss","sun":"su","swa":"sw","swe":"sv","tah":"ty","tam":"ta","tat":"tt","tel":"te","tgk":"tg","tgl":"tl","tha":"th","tib":"bo","tir":"ti","ton":"to","tsn":"tn","tso":"ts","tuk":"tk","tur":"tr","twi":"tw","uig":"ug","ukr":"uk","urd":"ur","uzb":"uz","ven":"ve","vie":"vi","vol":"vo","wel":"cy","wln":"wa","wol":"wo","xho":"xh","yid":"yi","yor":"yo","zha":"za","zho":"zh","zul":"zu"}'
+UNKNOWN_LOG="${UNKNOWN_LOG:-/tmp/unknown_langs.log}"
+
+# normalize_langs <comma-separated-codes> -> normalizovaný comma-separated (unique)
+normalize_langs() {
+  local raw="$1"
+  [ -z "$raw" ] && { echo ""; return; }
+  echo "$raw" | jq -Rr --argjson map "$ISO_MAP" '
+    split(",")
+    | map(
+        ascii_downcase
+        | gsub("^\\s+|\\s+$";"")          # trim
+        | . as $orig
+        # regionální varianta -> část před pomlčkou (es-419->es, pt-br->pt, zh-hans->zh)
+        | (if test("-") then split("-")[0] else . end) as $base
+        # zahodit ne-jazyky
+        | if ($base | IN("und","mul","mis","zxx","")) then empty
+          # už 2-písmenný -> nech
+          elif ($base | length == 2) then $base
+          # 3-písmenný v mapě -> přelož
+          elif ($map[$base] != null) then $map[$base]
+          # neznámý -> nech projít (zaloguje se zvlášť v bashi)
+          else $base end
+      )
+    | unique
+    | join(",")
+  '
+}
+
+# log_unknown <comma-separated-codes> — zapíše kódy, co nejsou 2-písm ani v mapě
+log_unknown() {
+  local raw="$1"
+  [ -z "$raw" ] && return
+  echo "$raw" | tr ',' '\n' | while read -r c; do
+    c=$(echo "$c" | tr '[:upper:]' '[:lower:]' | sed 's/-.*//; s/^ *//; s/ *$//')
+    [ -z "$c" ] && continue
+    case "$c" in und|mul|mis|zxx) continue;; esac
+    [ ${#c} -eq 2 ] && continue
+    echo "$ISO_MAP" | jq -e --arg c "$c" 'has($c)' >/dev/null 2>&1 && continue
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $c" >> "$UNKNOWN_LOG"
+  done
+}
+
 # ---- Login -> token ----
 login() {
   local resp
@@ -153,8 +201,13 @@ probe_mkv() {
   audio=$(echo "$j" | jq -r '[.tracks[] | select(.type=="audio")
           | (.properties.language_ietf // .properties.language // "und")] | unique | join(",")')
 
-  local clean; clean=$(echo "$subs$audio" | tr -d ',und')
-  if [ -z "$clean" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
+  # zaloguj neznámé kódy (ze surových, před normalizací), pak normalizuj na 639-1
+  log_unknown "$subs"; log_unknown "$audio"
+  subs=$(normalize_langs "$subs")
+  audio=$(normalize_langs "$audio")
+
+  # empty = po normalizaci nic nezbylo (jen und/mul/zahozené)
+  if [ -z "$subs$audio" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
 }
 
 # ---- Probe MP4/MOV: ffprobe čte přímo přes HTTP (bez lokálního stažení) ----
@@ -178,8 +231,12 @@ probe_mp4() {
   local nstreams; nstreams=$(echo "$j" | jq '.streams | length')
   [ "$nstreams" -gt 0 ] 2>/dev/null || { echo "error||"; return; }
 
-  local clean; clean=$(echo "$subs$audio" | tr -d ',und')
-  if [ -z "$clean" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
+  # zaloguj neznámé, pak normalizuj na 639-1
+  log_unknown "$subs"; log_unknown "$audio"
+  subs=$(normalize_langs "$subs")
+  audio=$(normalize_langs "$audio")
+
+  if [ -z "$subs$audio" ]; then echo "empty|$subs|$audio"; else echo "ok|$subs|$audio"; fi
 }
 
 # ---- Rozcestník: podle přípony REÁLNÉHO jména (short_name z TorBoxu) ----
@@ -310,3 +367,48 @@ while [ "$processed" -lt "$LIMIT" ]; do
 done
 
 log "Hotovo — zpracováno $processed, výstup: $OUT"
+
+# ---- Odeslání výsledků do indexeru (jeden POST na konci běhu) ----
+# Mapování worker status -> endpoint status: ok->cached, empty/nonmkv/zip->no_data,
+# uncached/error->uncached. Jazyky (už normalizované 639-1) se joinnou z JSONL
+# array na comma-separated string. uncached se posílá bez jazyků (endpoint je jen
+# nechá v kandidátech). Pole audio_codec/dual_audio/multi_subs zatím neposíláme.
+post_results() {
+  [ -s "$OUT" ] || { log "POST: žádné výsledky k odeslání"; return; }
+
+  # sestav {results:[...]} z JSONL — mapuj status, joinni jazyky na string
+  local payload
+  payload=$(jq -s '{
+    results: [ .[] | {
+      id: .id,
+      status: ( { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
+                  "zip":"no_data", "uncached":"uncached", "error":"uncached" }[.status] // "uncached" ),
+      subtitle_langs: (.subtitle_langs | join(",")),
+      audio_langs:    (.audio_langs    | join(","))
+    }
+    # u uncached neposílej jazyky (stejně prázdné), u no_data nech audio kdyby bylo
+    | if .status=="uncached" then {id,status} else . end ]
+  }' "$OUT")
+
+  local n; n=$(echo "$payload" | jq '.results | length')
+  log "POST: odesílám $n výsledků na indexer..."
+
+  local resp
+  resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  # zaloguj odpověď endpointu
+  if echo "$resp" | jq -e '.updated' >/dev/null 2>&1; then
+    log "POST OK: $(echo "$resp" | jq -c '{updated,uncached,no_data,errors:(.errors|length)}')"
+  else
+    log "POST SELHAL — odpověď: $resp"
+    log "Výsledky zůstávají v $OUT (lze poslat ručně)"
+  fi
+}
+
+# token může být starý (běh trval ~33 min) — obnov před POSTem
+login
+post_results
+
