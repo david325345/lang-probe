@@ -267,106 +267,130 @@ login
 log "Start — limit=$LIMIT, batch=$BATCH_SIZE, sleep=${SLEEP_BETWEEN}s, out=$OUT"
 
 processed=0
-after_id=0
+# ---- Zpracování jedné fáze (0 = neprobnuté, 1 = uncached retry) ----
+# Bere torrenty z indexeru pro danou fázi a probíná je, dokud není fáze
+# ---- Hlavní smyčka ----
+# Endpoint řeší prioritu (neprobnuté první, uncached potom) i počítání pokusů
+# sám — worker jen bere dávky a probíná, dokud není done nebo nedojde strop.
+# Noční cron: jednorázový běh, doběhne a skončí (žádná pauza/smyčka navíc).
+run_probe() {
+  log "=== Start probe (strop: $LIMIT) ==="
 
-while [ "$processed" -lt "$LIMIT" ]; do
-  # --- dávka z indexeru ---
-  batch=$(curl -s -m 20 "$INDEXER_URL/api/admin/lang-probe/batch?limit=$BATCH_SIZE&afterId=$after_id" \
-    -H "Authorization: Bearer $TOKEN")
-  n=$(echo "$batch" | jq '.items | length' 2>/dev/null || echo 0)
-  [ "$n" -gt 0 ] || { log "Žádné další položky — konec."; break; }
+  while [ "$processed" -lt "$LIMIT" ]; do
+    # --- dávka z indexeru (endpoint sám řadí: neprobnuté první, uncached potom) ---
+    local batch n
+    batch=$(curl -s -m 20 "$INDEXER_URL/api/admin/lang-probe/batch?limit=$BATCH_SIZE" \
+      -H "Authorization: Bearer $TOKEN")
 
-  # --- hromadný checkcached na celou dávku ---
-  hashes=$(echo "$batch" | jq -r '[.items[].infohash] | join(",")')
-  cached=$(tb_checkcached "$hashes")   # objekt {hash:{...}}
-
-  # --- iterace přes položky ---
-  count=$(echo "$batch" | jq '.items | length')
-  i=0
-  while [ "$i" -lt "$count" ] && [ "$processed" -lt "$LIMIT" ]; do
-    item=$(echo "$batch" | jq -c ".items[$i]")
-    i=$((i+1))
-
-    id=$(echo "$item"     | jq -r '.id')
-    hash=$(echo "$item"   | jq -r '.infohash')
-    hname=$(echo "$item"  | jq -r '.file_hint.name // ""')
-    hsize=$(echo "$item"  | jq -r '.file_hint.size // 0')
-
-    # cached?
-    is_cached=$(echo "$cached" | jq --arg h "$hash" 'has($h)')
-    if [ "$is_cached" != "true" ]; then
-      log "  #$id uncached — skip"
-      emit "$id" "$hash" "uncached" "" "" "$hname"
-      processed=$((processed+1)); continue
+    # 401 -> token expiroval -> re-login a zkus dávku znovu
+    if echo "$batch" | jq -e '.needLogin // (.error=="Unauthorized")' >/dev/null 2>&1; then
+      log "Token expiroval — re-login."
+      login
+      continue
     fi
 
-    # Neprobovatelné formáty — .avi/.wmv nenesou per-stream jazyk,
-    # indexer je řeší z názvu. .mp4/.mov/.mkv/.webm jdou dál.
-    if echo "$hname" | grep -qiE '\.(avi|wmv|flv|mpg|mpeg|ts)$'; then
-      log "  #$id nonmkv ($hname) — indexer řeší z názvu, skip"
-      emit "$id" "$hash" "nonmkv" "" "" "$hname"
-      processed=$((processed+1)); continue
-    fi
+    n=$(echo "$batch" | jq '.items | length' 2>/dev/null || echo 0)
+    [ "$n" -gt 0 ] || { log "Fronta prázdná (done) — konec."; return 0; }
 
-    # přidat torrent -> id
-    tid=$(tb_add "$hash")
-    if [ -z "$tid" ]; then
-      log "  #$id createtorrent selhal — skip"
-      emit "$id" "$hash" "error" "" "" "$hname"
-      processed=$((processed+1)); continue
-    fi
+    # --- hromadný checkcached na celou dávku ---
+    local hashes cached
+    hashes=$(echo "$batch" | jq -r '[.items[].infohash] | join(",")')
+    cached=$(tb_checkcached "$hashes")
 
-    # struktura -> vyber soubor
-    files=$(tb_files "$tid")
-    picked=$(pick_file "$files" "$hname" "$hsize")
-    if [ -z "$picked" ]; then
-      log "  #$id žádný video soubor (nejspíš zip) — skip"
-      emit "$id" "$hash" "zip" "" "" "$hname"
+    # --- iterace přes položky ---
+    local count i
+    count=$(echo "$batch" | jq '.items | length')
+    i=0
+    while [ "$i" -lt "$count" ] && [ "$processed" -lt "$LIMIT" ]; do
+      local item id hash hname hsize is_cached tid files picked fid mt sname url res st subs audio
+      item=$(echo "$batch" | jq -c ".items[$i]")
+      i=$((i+1))
+
+      id=$(echo "$item"     | jq -r '.id')
+      hash=$(echo "$item"   | jq -r '.infohash')
+      hname=$(echo "$item"  | jq -r '.file_hint.name // ""')
+      hsize=$(echo "$item"  | jq -r '.file_hint.size // 0')
+
+      # cached?
+      is_cached=$(echo "$cached" | jq --arg h "$hash" 'has($h)')
+      if [ "$is_cached" != "true" ]; then
+        log "  #$id uncached — skip"
+        emit "$id" "$hash" "uncached" "" "" "$hname"
+        processed=$((processed+1)); continue
+      fi
+
+      # Neprobovatelné formáty — .avi/.wmv nenesou per-stream jazyk,
+      # indexer je řeší z názvu. .mp4/.mov/.mkv/.webm jdou dál.
+      if echo "$hname" | grep -qiE '\.(avi|wmv|flv|mpg|mpeg|ts)$'; then
+        log "  #$id nonmkv ($hname) — indexer řeší z názvu, skip"
+        emit "$id" "$hash" "nonmkv" "" "" "$hname"
+        processed=$((processed+1)); continue
+      fi
+
+      # přidat torrent -> id
+      tid=$(tb_add "$hash")
+      if [ -z "$tid" ]; then
+        log "  #$id createtorrent selhal — skip"
+        emit "$id" "$hash" "error" "" "" "$hname"
+        processed=$((processed+1)); continue
+      fi
+
+      # struktura -> vyber soubor
+      files=$(tb_files "$tid")
+      picked=$(pick_file "$files" "$hname" "$hsize")
+      if [ -z "$picked" ]; then
+        log "  #$id žádný video soubor (nejspíš zip) — skip"
+        emit "$id" "$hash" "zip" "" "" "$hname"
+        tb_delete "$tid"
+        processed=$((processed+1)); continue
+      fi
+      fid=$(printf '%s' "$picked" | cut -f1)
+      mt=$(printf '%s'  "$picked" | cut -f2)
+      sname=$(printf '%s' "$picked" | cut -f3)   # reálné jméno z TorBoxu (spolehlivá přípona)
+
+      # pojistka na zip mimetype
+      if echo "$mt" | grep -qi 'zip'; then
+        log "  #$id zip mimetype — skip"
+        emit "$id" "$hash" "zip" "" "" "$hname"
+        tb_delete "$tid"
+        processed=$((processed+1)); continue
+      fi
+
+      # requestdl -> URL
+      url=$(tb_dl "$tid" "$fid")
+      if [ -z "$url" ]; then
+        log "  #$id requestdl selhal — skip"
+        emit "$id" "$hash" "error" "" "" "$hname"
+        tb_delete "$tid"
+        processed=$((processed+1)); continue
+      fi
+
+      # probe (rozcestník podle REÁLNÉHO jména z TorBoxu + mimetype)
+      res=$(probe_langs "$url" "$sname" "$mt")
+      st=$(printf '%s'    "$res" | cut -d'|' -f1)
+      subs=$(printf '%s'  "$res" | cut -d'|' -f2)
+      audio=$(printf '%s' "$res" | cut -d'|' -f3)
+      log "  #$id $st  subs=[$subs] audio=[$audio]"
+      emit "$id" "$hash" "$st" "$subs" "$audio" "$hname"
+
+      # úklid + rozestup
       tb_delete "$tid"
-      processed=$((processed+1)); continue
-    fi
-    fid=$(printf '%s' "$picked" | cut -f1)
-    mt=$(printf '%s'  "$picked" | cut -f2)
-    sname=$(printf '%s' "$picked" | cut -f3)   # reálné jméno z TorBoxu (spolehlivá přípona)
+      processed=$((processed+1))
+      [ "$processed" -lt "$LIMIT" ] && sleep "$SLEEP_BETWEEN"
+    done
 
-    # pojistka na zip mimetype
-    if echo "$mt" | grep -qi 'zip'; then
-      log "  #$id zip mimetype — skip"
-      emit "$id" "$hash" "zip" "" "" "$hname"
-      tb_delete "$tid"
-      processed=$((processed+1)); continue
-    fi
-
-    # requestdl -> URL
-    url=$(tb_dl "$tid" "$fid")
-    if [ -z "$url" ]; then
-      log "  #$id requestdl selhal — skip"
-      emit "$id" "$hash" "error" "" "" "$hname"
-      tb_delete "$tid"
-      processed=$((processed+1)); continue
-    fi
-
-    # probe (rozcestník podle REÁLNÉHO jména z TorBoxu + mimetype)
-    res=$(probe_langs "$url" "$sname" "$mt")
-    st=$(printf '%s'    "$res" | cut -d'|' -f1)
-    subs=$(printf '%s'  "$res" | cut -d'|' -f2)
-    audio=$(printf '%s' "$res" | cut -d'|' -f3)
-    log "  #$id $st  subs=[$subs] audio=[$audio]"
-    emit "$id" "$hash" "$st" "$subs" "$audio" "$hname"
-
-    # úklid + rozestup
-    tb_delete "$tid"
-    processed=$((processed+1))
-    [ "$processed" -lt "$LIMIT" ] && sleep "$SLEEP_BETWEEN"
+    # done:true -> fronta vyčerpaná, konec (endpoint řídí prioritu i retry sám)
+    local done_flag; done_flag=$(echo "$batch" | jq -r '.done')
+    [ "$done_flag" = "true" ] && { log "done=true — fronta hotová."; return 0; }
   done
 
-  # posun cursoru
-  after_id=$(echo "$batch" | jq -r '.nextAfterId')
-  done_flag=$(echo "$batch" | jq -r '.done')
-  [ "$done_flag" = "true" ] && { log "Indexer done=true — konec."; break; }
-done
+  log "Dosažen strop $LIMIT."
+  return 0
+}
 
-log "Hotovo — zpracováno $processed, výstup: $OUT"
+run_probe
+
+log "Hotovo — zpracováno celkem $processed, výstup: $OUT"
 
 # ---- Odeslání výsledků do indexeru (jeden POST na konci běhu) ----
 # Mapování worker status -> endpoint status: ok->cached, empty/nonmkv/zip->no_data,
