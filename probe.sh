@@ -21,7 +21,8 @@ TORBOX_API="${TORBOX_API:-https://api.torbox.app/v1/api}"
 LIMIT="${PROBE_LIMIT:-150}"          # max torrentů za běh (strop /noc)
 BATCH_SIZE="${PROBE_BATCH_SIZE:-50}" # kolik si vzít z indexeru na dávku
 SLEEP_BETWEEN="${PROBE_SLEEP:-20}"   # rozestup mezi torrenty (s)
-RANGE_BYTES="${PROBE_RANGE:-262143}" # 256 KB - 1
+RANGE_BYTES="${PROBE_RANGE:-524287}"       # 512 KB - 1 (základní pokus)
+RANGE_RETRY="${PROBE_RANGE_RETRY:-2097151}" # 2 MB - 1 (retry když se Tracks nevešel)
 OUT="${PROBE_OUT:-/tmp/results.jsonl}"
 BATCH_OUT="/tmp/batch_results.jsonl"   # výsledky jen aktuální dávky (POST po dávce)
 TMP="/tmp/probe_work.bin"
@@ -188,31 +189,47 @@ pick_file() {
 # Vrací status na stdout: "ok|SUBS|AUDIO" / "empty|..." / "error:<duvod>||"
 # Důvody: curl (stažení selhalo), empty-file (0 B), magic-<hex> (není MKV),
 #         mkv-noout (mkvmerge nic nevrátil), mkv-badjson (neúplný JSON)
+# DVA POKUSY: základ RANGE_BYTES (512 KB), a když mkvmerge nedá validní JSON
+# (Tracks se do rozsahu nevešel), zopakuje se s RANGE_RETRY (2 MB).
 probe_mkv() {
   local url="$1"
-  if ! curl -s -m 30 -r "0-$RANGE_BYTES" -o "$TMP" "$url"; then
-    echo "error:curl||"; return
-  fi
+  local attempt=1 range="$RANGE_BYTES" j=""
 
-  local fsize; fsize=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
-  [ "$fsize" -gt 0 ] 2>/dev/null || { echo "error:empty-file||"; return; }
+  while :; do
+    if ! curl -s -m 60 -r "0-$range" -o "$TMP" "$url"; then
+      echo "error:curl||"; return
+    fi
 
-  # ověř MKV magic (1a 45 df a3); jinak neprobovatelné
-  local magic; magic=$(od -A n -t x1 -N 4 "$TMP" | tr -d ' \n')
-  if [ "$magic" != "1a45dfa3" ]; then
-    # 504b0304 = ZIP (PK..), jinak vypiš co to vlastně je
-    if [ "$magic" = "504b0304" ]; then echo "error:magic-zip||"
-    else echo "error:magic-$magic||"; fi
-    return
-  fi
+    local fsize; fsize=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
+    [ "$fsize" -gt 0 ] 2>/dev/null || { echo "error:empty-file||"; return; }
 
-  local j; j=$(mkvmerge -J "$TMP" 2>/dev/null)
-  [ -n "$j" ] || { echo "error:mkv-noout||"; return; }
+    # ověř MKV magic (1a 45 df a3); jinak neprobovatelné (retry nepomůže)
+    local magic; magic=$(od -A n -t x1 -N 4 "$TMP" | tr -d ' \n')
+    if [ "$magic" != "1a45dfa3" ]; then
+      if [ "$magic" = "504b0304" ]; then echo "error:magic-zip||"
+      else echo "error:magic-$magic||"; fi
+      return
+    fi
 
-  # mkvmerge někdy vrátí NEÚPLNÝ JSON (useknutý výstup) -> jq by vypsal
-  # "parse error" do logu a stopa by se tiše označila jako empty.
-  # Radši vrátit error: endpoint to vezme jako uncached a zkusí se znovu.
-  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error:mkv-badjson||"; return; }
+    j=$(mkvmerge -J "$TMP" 2>/dev/null)
+
+    # validní JSON? -> hotovo, pokračuj na extrakci jazyků
+    if [ -n "$j" ] && echo "$j" | jq -e . >/dev/null 2>&1; then
+      break
+    fi
+
+    # neúplný/prázdný výstup -> Tracks se nejspíš nevešel; zkus větší rozsah
+    if [ "$attempt" -eq 1 ]; then
+      attempt=2
+      range="$RANGE_RETRY"
+      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (Tracks se nevešel)"
+      continue
+    fi
+
+    # ani druhý pokus nepomohl
+    [ -n "$j" ] && { echo "error:mkv-badjson||"; return; }
+    echo "error:mkv-noout||"; return
+  done
 
   # subtitle + audio jazyky (IETF, fallback na language); video ignorujeme
   local subs audio
