@@ -1,10 +1,10 @@
 # NimeToDex lang-probe — noční běh
 # Kontejner běží v TZ=Europe/Prague (viz Dockerfile), takže tento čas
-# je PRAŽSKÝ. Spustí se v 1:00 v noci, doběhne max 100 torrentů
-# (~33 min při 20s rozestupu), vejde se do okna 1:00-6:00.
+# je PRAŽSKÝ. Spustí se v 1:00 v noci, doběhne max 150 torrentů
+# (~50 min při 20s rozestupu), vejde se do okna 1:00-6:00.
 # Env proměnné cron nevidí — entrypoint je uloží do /app/env.sh.
 #
 # min hod den měsíc den-v-týdnu  uživatel  příkaz
-0 1 * * * root . /app/env.sh; /app/probe.sh --limit 100 >> /tmp/cron.log 2>&1
+0 1 * * * root . /app/env.sh; /app/probe.sh --limit 150 >> /tmp/cron.log 2>&1
 # prázdný řádek na konci je povinný pro cron ↓
 

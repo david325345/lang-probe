@@ -18,11 +18,12 @@ set -uo pipefail
 # ---- Konfigurace (env s rozumnými defaulty) ----
 INDEXER_URL="${INDEXER_URL:-http://indexer:3003}"
 TORBOX_API="${TORBOX_API:-https://api.torbox.app/v1/api}"
-LIMIT="${PROBE_LIMIT:-100}"          # max torrentů za běh (strop /noc)
+LIMIT="${PROBE_LIMIT:-150}"          # max torrentů za běh (strop /noc)
 BATCH_SIZE="${PROBE_BATCH_SIZE:-50}" # kolik si vzít z indexeru na dávku
 SLEEP_BETWEEN="${PROBE_SLEEP:-20}"   # rozestup mezi torrenty (s)
 RANGE_BYTES="${PROBE_RANGE:-262143}" # 256 KB - 1
 OUT="${PROBE_OUT:-/tmp/results.jsonl}"
+BATCH_OUT="/tmp/batch_results.jsonl"   # výsledky jen aktuální dávky (POST po dávce)
 TMP="/tmp/probe_work.bin"
 
 # ---- Argumenty ----
@@ -46,6 +47,8 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 # JSONL řádek přes jq (bezpečné escapování názvů s [] a diakritikou)
 emit() {
   # emit <id> <infohash> <status> <subs_csv> <audio_csv> <name>
+  # Píše do celkového logu ($OUT) i do dávkového souboru ($BATCH_OUT),
+  # ze kterého se POSTuje po každé dávce.
   jq -cn \
     --argjson id "$1" \
     --arg hash "$2" \
@@ -56,7 +59,7 @@ emit() {
     '{id:$id, infohash:$hash, status:$status,
       subtitle_langs: ($subs | if .=="" then [] else split(",") end),
       audio_langs:    ($audio | if .=="" then [] else split(",") end),
-      name:$name, ts: (now|todate)}' >> "$OUT"
+      name:$name, ts: (now|todate)}' | tee -a "$OUT" >> "$BATCH_OUT"
 }
 
 # ---- Normalizace jazykových kódů: ISO 639-2/B a /T -> 639-1 ----
@@ -269,6 +272,63 @@ log "Start — limit=$LIMIT, batch=$BATCH_SIZE, sleep=${SLEEP_BETWEEN}s, out=$OU
 processed=0
 # ---- Zpracování jedné fáze (0 = neprobnuté, 1 = uncached retry) ----
 # Bere torrenty z indexeru pro danou fázi a probíná je, dokud není fáze
+# ---- Odeslání výsledků do indexeru (jeden POST na konci běhu) ----
+# Mapování worker status -> endpoint status: ok->cached, empty/nonmkv/zip->no_data,
+# uncached/error->uncached. Jazyky (už normalizované 639-1) se joinnou z JSONL
+# array na comma-separated string. uncached se posílá bez jazyků (endpoint je jen
+# nechá v kandidátech). Pole audio_codec/dual_audio/multi_subs zatím neposíláme.
+post_results() {
+  local src="${1:-$OUT}"
+  [ -s "$src" ] || { log "POST: žádné výsledky k odeslání"; return; }
+
+  # přeskoč případné rozbité řádky (neúplný JSON — způsoboval jq parse error)
+  local clean="/tmp/clean_$$.jsonl"
+  grep -a '^{.*}$' "$src" > "$clean" 2>/dev/null || true
+  [ -s "$clean" ] || { log "POST: žádné platné řádky"; rm -f "$clean"; return; }
+
+  # sestav {results:[...]} z JSONL — mapuj status, joinni jazyky na string
+  local payload
+  payload=$(jq -s '{
+    results: [ .[] | {
+      id: .id,
+      status: ( { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
+                  "zip":"no_data", "uncached":"uncached", "error":"uncached" }[.status] // "uncached" ),
+      subtitle_langs: (.subtitle_langs | join(",")),
+      audio_langs:    (.audio_langs    | join(","))
+    }
+    # u uncached neposílej jazyky (stejně prázdné), u no_data nech audio kdyby bylo
+    | if .status=="uncached" then {id,status} else . end ]
+  }' "$clean")
+  rm -f "$clean"
+
+  local n; n=$(echo "$payload" | jq '.results | length')
+  log "POST: odesílám $n výsledků na indexer..."
+
+  local resp
+  resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  # 401 -> token expiroval -> re-login a zkus POST znovu
+  if echo "$resp" | jq -e '.needLogin // (.error=="Unauthorized")' >/dev/null 2>&1; then
+    log "POST: token expiroval — re-login a retry."
+    login
+    resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$payload")
+  fi
+
+  # zaloguj odpověď endpointu
+  if echo "$resp" | jq -e '.updated' >/dev/null 2>&1; then
+    log "POST OK: $(echo "$resp" | jq -c '{updated,uncached,no_data,errors:(.errors|length)}')"
+  else
+    log "POST SELHAL — odpověď: $resp"
+    log "Výsledky zůstávají v $OUT (lze poslat ručně)"
+  fi
+}
+
 # ---- Hlavní smyčka ----
 # Endpoint řeší prioritu (neprobnuté první, uncached potom) i počítání pokusů
 # sám — worker jen bere dávky a probíná, dokud není done nebo nedojde strop.
@@ -301,6 +361,7 @@ run_probe() {
     local count i
     count=$(echo "$batch" | jq '.items | length')
     i=0
+    : > "$BATCH_OUT"   # výsledky jen této dávky (POSTnou se hned po ní)
     while [ "$i" -lt "$count" ] && [ "$processed" -lt "$LIMIT" ]; do
       local item id hash hname hsize is_cached tid files picked fid mt sname url res st subs audio
       item=$(echo "$batch" | jq -c ".items[$i]")
@@ -379,6 +440,11 @@ run_probe() {
       [ "$processed" -lt "$LIMIT" ] && sleep "$SLEEP_BETWEEN"
     done
 
+    # POST výsledků TÉTO dávky hned — indexer tím ví, co je hotové, a další
+    # GET vrátí NOVÉ položky. (Bez toho endpoint vracel tu samou dávku znovu
+    # a worker probíral duplicity — polovina stropu se protočila nadarmo.)
+    post_results "$BATCH_OUT"
+
     # done:true -> fronta vyčerpaná, konec (endpoint řídí prioritu i retry sám)
     local done_flag; done_flag=$(echo "$batch" | jq -r '.done')
     [ "$done_flag" = "true" ] && { log "done=true — fronta hotová."; return 0; }
@@ -392,47 +458,8 @@ run_probe
 
 log "Hotovo — zpracováno celkem $processed, výstup: $OUT"
 
-# ---- Odeslání výsledků do indexeru (jeden POST na konci běhu) ----
-# Mapování worker status -> endpoint status: ok->cached, empty/nonmkv/zip->no_data,
-# uncached/error->uncached. Jazyky (už normalizované 639-1) se joinnou z JSONL
-# array na comma-separated string. uncached se posílá bez jazyků (endpoint je jen
-# nechá v kandidátech). Pole audio_codec/dual_audio/multi_subs zatím neposíláme.
-post_results() {
-  [ -s "$OUT" ] || { log "POST: žádné výsledky k odeslání"; return; }
 
-  # sestav {results:[...]} z JSONL — mapuj status, joinni jazyky na string
-  local payload
-  payload=$(jq -s '{
-    results: [ .[] | {
-      id: .id,
-      status: ( { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
-                  "zip":"no_data", "uncached":"uncached", "error":"uncached" }[.status] // "uncached" ),
-      subtitle_langs: (.subtitle_langs | join(",")),
-      audio_langs:    (.audio_langs    | join(","))
-    }
-    # u uncached neposílej jazyky (stejně prázdné), u no_data nech audio kdyby bylo
-    | if .status=="uncached" then {id,status} else . end ]
-  }' "$OUT")
-
-  local n; n=$(echo "$payload" | jq '.results | length')
-  log "POST: odesílám $n výsledků na indexer..."
-
-  local resp
-  resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$payload")
-
-  # zaloguj odpověď endpointu
-  if echo "$resp" | jq -e '.updated' >/dev/null 2>&1; then
-    log "POST OK: $(echo "$resp" | jq -c '{updated,uncached,no_data,errors:(.errors|length)}')"
-  else
-    log "POST SELHAL — odpověď: $resp"
-    log "Výsledky zůstávají v $OUT (lze poslat ručně)"
-  fi
-}
-
-# token může být starý (běh trval ~33 min) — obnov před POSTem
-login
-post_results
+# POST se dělá po KAŽDÉ dávce uvnitř run_probe (viz post_results tam),
+# takže tady se už nic neposílá. Výhoda: endpoint průběžně ví, co je hotové
+# (nevrací duplicity), a když worker spadne v půlce, probnuté je už zapsané.
 
