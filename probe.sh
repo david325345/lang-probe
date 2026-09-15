@@ -197,6 +197,11 @@ probe_mkv() {
   local j; j=$(mkvmerge -J "$TMP" 2>/dev/null)
   [ -n "$j" ] || { echo "error||"; return; }
 
+  # mkvmerge někdy vrátí NEÚPLNÝ JSON (useknutý výstup) -> jq by vypsal
+  # "parse error" do logu a stopa by se tiše označila jako empty.
+  # Radši vrátit error: endpoint to vezme jako uncached a zkusí se znovu.
+  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error||"; return; }
+
   # subtitle + audio jazyky (IETF, fallback na language); video ignorujeme
   local subs audio
   subs=$(echo "$j" | jq -r '[.tracks[] | select(.type=="subtitles")
@@ -223,6 +228,9 @@ probe_mp4() {
   j=$(ffprobe -v quiet -print_format json -show_streams \
         -analyzeduration 0 -probesize 2M "$url" 2>/dev/null)
   [ -n "$j" ] || { echo "error||"; return; }
+
+  # stejná pojistka jako u mkvmerge — neúplný JSON -> error, ne falešné empty
+  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error||"; return; }
 
   local subs audio
   subs=$(echo "$j" | jq -r '[.streams[] | select(.codec_type=="subtitle")
