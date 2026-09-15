@@ -185,22 +185,34 @@ pick_file() {
 }
 
 # ---- Probe MKV/WebM: range download + mkvmerge -> jazyky ----
-# Vrací status na stdout: "ok|SUBS_CSV|AUDIO_CSV"  nebo  "empty|..." nebo "error||"
+# Vrací status na stdout: "ok|SUBS|AUDIO" / "empty|..." / "error:<duvod>||"
+# Důvody: curl (stažení selhalo), empty-file (0 B), magic-<hex> (není MKV),
+#         mkv-noout (mkvmerge nic nevrátil), mkv-badjson (neúplný JSON)
 probe_mkv() {
   local url="$1"
-  curl -s -m 30 -r "0-$RANGE_BYTES" -o "$TMP" "$url" || { echo "error||"; return; }
+  if ! curl -s -m 30 -r "0-$RANGE_BYTES" -o "$TMP" "$url"; then
+    echo "error:curl||"; return
+  fi
+
+  local fsize; fsize=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
+  [ "$fsize" -gt 0 ] 2>/dev/null || { echo "error:empty-file||"; return; }
 
   # ověř MKV magic (1a 45 df a3); jinak neprobovatelné
   local magic; magic=$(od -A n -t x1 -N 4 "$TMP" | tr -d ' \n')
-  [ "$magic" = "1a45dfa3" ] || { echo "error||"; return; }
+  if [ "$magic" != "1a45dfa3" ]; then
+    # 504b0304 = ZIP (PK..), jinak vypiš co to vlastně je
+    if [ "$magic" = "504b0304" ]; then echo "error:magic-zip||"
+    else echo "error:magic-$magic||"; fi
+    return
+  fi
 
   local j; j=$(mkvmerge -J "$TMP" 2>/dev/null)
-  [ -n "$j" ] || { echo "error||"; return; }
+  [ -n "$j" ] || { echo "error:mkv-noout||"; return; }
 
   # mkvmerge někdy vrátí NEÚPLNÝ JSON (useknutý výstup) -> jq by vypsal
   # "parse error" do logu a stopa by se tiše označila jako empty.
   # Radši vrátit error: endpoint to vezme jako uncached a zkusí se znovu.
-  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error||"; return; }
+  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error:mkv-badjson||"; return; }
 
   # subtitle + audio jazyky (IETF, fallback na language); video ignorujeme
   local subs audio
@@ -227,10 +239,10 @@ probe_mp4() {
   local j
   j=$(ffprobe -v quiet -print_format json -show_streams \
         -analyzeduration 0 -probesize 2M "$url" 2>/dev/null)
-  [ -n "$j" ] || { echo "error||"; return; }
+  [ -n "$j" ] || { echo "error:ff-noout||"; return; }
 
   # stejná pojistka jako u mkvmerge — neúplný JSON -> error, ne falešné empty
-  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error||"; return; }
+  echo "$j" | jq -e . >/dev/null 2>&1 || { echo "error:ff-badjson||"; return; }
 
   local subs audio
   subs=$(echo "$j" | jq -r '[.streams[] | select(.codec_type=="subtitle")
@@ -240,7 +252,7 @@ probe_mp4() {
 
   # ffprobe nevrátil žádný stream -> error (ne empty)
   local nstreams; nstreams=$(echo "$j" | jq '.streams | length')
-  [ "$nstreams" -gt 0 ] 2>/dev/null || { echo "error||"; return; }
+  [ "$nstreams" -gt 0 ] 2>/dev/null || { echo "error:ff-nostreams||"; return; }
 
   # zaloguj neznámé, pak normalizuj na 639-1
   log_unknown "$subs"; log_unknown "$audio"
@@ -299,8 +311,11 @@ post_results() {
   payload=$(jq -s '{
     results: [ .[] | {
       id: .id,
-      status: ( { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
-                  "zip":"no_data", "uncached":"uncached", "error":"uncached" }[.status] // "uncached" ),
+      # status může nést podtyp (error:curl, error:magic-zip…) — pro endpoint
+      # se bere jen část před dvojtečkou; podtyp slouží jen k diagnostice v logu
+      status: ( (.status | split(":")[0]) as $s
+                | { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
+                    "zip":"no_data", "uncached":"uncached", "error":"uncached" }[$s] // "uncached" ),
       subtitle_langs: (.subtitle_langs | join(",")),
       audio_langs:    (.audio_langs    | join(","))
     }
