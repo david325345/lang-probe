@@ -211,24 +211,31 @@ probe_mkv() {
       return
     fi
 
-    j=$(mkvmerge -J "$TMP" 2>/dev/null)
+    # stderr zachytíme do souboru — při selhání ho zalogujeme, ať víme PROČ
+    j=$(mkvmerge -J "$TMP" 2>/tmp/mkvmerge_err.txt)
 
     # validní JSON? -> hotovo, pokračuj na extrakci jazyků
     if [ -n "$j" ] && echo "$j" | jq -e . >/dev/null 2>&1; then
       break
     fi
 
-    # neúplný/prázdný výstup -> Tracks se nejspíš nevešel; zkus větší rozsah
+    # neúplný/prázdný výstup -> zkus větší rozsah
     if [ "$attempt" -eq 1 ]; then
       attempt=2
       range="$RANGE_RETRY"
       # POZOR: uvnitř probe_mkv jde log na STDERR — stdout nese návratovou
       # hodnotu funkce ("ok|subs|audio"), takže zápis na stdout by ji rozbil.
-      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (Tracks se nevešel)" >&2
+      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (1. pokus nedal validní JSON)" >&2
       continue
     fi
 
-    # ani druhý pokus nepomohl
+    # ani druhý pokus nepomohl — zaloguj, co mkvmerge reálně říká
+    log "    selhalo i na 2. pokus (staženo $fsize B)" >&2
+    local errmsg; errmsg=$(head -c 300 /tmp/mkvmerge_err.txt 2>/dev/null | tr '\n' ' ')
+    [ -n "$errmsg" ] && log "    mkvmerge stderr: $errmsg" >&2
+    # a kus výstupu, když vůbec něco vrátil (ukáže, kde se JSON utnul)
+    [ -n "$j" ] && log "    mkvmerge výstup (konec): ...$(echo "$j" | tail -c 120 | tr '\n' ' ')" >&2
+
     [ -n "$j" ] && { echo "error:mkv-badjson||"; return; }
     echo "error:mkv-noout||"; return
   done
