@@ -222,7 +222,9 @@ probe_mkv() {
     if [ "$attempt" -eq 1 ]; then
       attempt=2
       range="$RANGE_RETRY"
-      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (Tracks se nevešel)"
+      # POZOR: uvnitř probe_mkv jde log na STDERR — stdout nese návratovou
+      # hodnotu funkce ("ok|subs|audio"), takže zápis na stdout by ji rozbil.
+      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (Tracks se nevešel)" >&2
       continue
     fi
 
