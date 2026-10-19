@@ -8,6 +8,7 @@ set -e
 # který si crontab i probe.sh načte přes `. /app/env.sh`.
 {
   echo "export TORBOX_API_KEY='${TORBOX_API_KEY:-}'"
+  echo "export INDEXER_API_KEY='${INDEXER_API_KEY:-}'"
   echo "export INDEXER_USER='${INDEXER_USER:-}'"
   echo "export INDEXER_PASS='${INDEXER_PASS:-}'"
   echo "export INDEXER_URL='${INDEXER_URL:-http://indexer:3003}'"

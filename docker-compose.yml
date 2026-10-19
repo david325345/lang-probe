@@ -6,5 +6,7 @@ services:
     environment:
       # Nastav v Coolify jako environment variable, NE do gitu.
       - TORBOX_API_KEY=${TORBOX_API_KEY}
+      # přihlášení do indexeru: klíč (= SLUZBY_API_KEY indexeru), jinak INDEXER_USER + INDEXER_PASS
+      - INDEXER_API_KEY=${INDEXER_API_KEY}
     # Žádné publikované porty — fáze 1 nic nevystavuje ven.
     # Egress ven (api.torbox.app + CDN nody) jde defaultně.

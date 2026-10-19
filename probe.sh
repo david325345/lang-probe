@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # =====================================================================
-# NimeToDex lang-probe — FÁZE 2
-# Vezme dávky torrentů bez jazyků z indexeru, pro cached MKV vytáhne
-# jazyky stop (curl 256 KB range -> mkvmerge -J) a zapíše výsledky do
-# JSONL souboru. NEPOSÍLÁ nic zpět do indexeru (to je fáze 3).
+# NimeToDex lang-probe
+# Vezme z indexeru dávky torrentů bez titulků, u torrentů v cache TorBoxu
+# vytáhne jazyky stop (MKV/WebM: range download -> mkvmerge -J, MP4/MOV:
+# ffprobe přes HTTP) a po každé dávce pošle výsledky zpět do indexeru
+# (POST /api/admin/lang-probe/result).
 #
-# Cached-only: necached se přeskočí. Ne-MKV (.avi/.mp4) se přeskočí.
-# Zip (TorBox drží torrent jako .zip) se přeskočí. Po probu se torrent
-# smaže z TorBox accountu, ať se nehromadí sloty.
+# Cached-only: necached se nahlásí jako 'uncached' (indexer ho zkusí znovu
+# za 20 h / 3 dny, po 3 pokusech 'empty'). Zip a jiné ne-video formáty =
+# 'no_data' hned. Po probu se torrent smaže z TorBox accountu, ať se
+# nehromadí sloty (i při pádu skriptu — trap na konci).
+#
+# Přihlášení do indexeru: INDEXER_API_KEY (hlavička X-Api-Key, doporučeno),
+# jinak INDEXER_USER + INDEXER_PASS (POST /api/login -> token).
+# Výpadek TorBoxu (checkcached bez success) = konec běhu, nic se nehlásí.
 #
 # Ruční spuštění:   bash /app/probe.sh --limit 10
 # Noční cron:       bash /app/probe.sh --limit 100   (viz crontab)
@@ -41,7 +47,7 @@ for bin in curl jq mkvmerge od; do
   command -v "$bin" >/dev/null 2>&1 || { echo "CHYBÍ nástroj: $bin" >&2; exit 1; }
 done
 [ -n "${TORBOX_API_KEY:-}" ] || { echo "CHYBÍ env TORBOX_API_KEY" >&2; exit 1; }
-[ -n "${INDEXER_USER:-}" ] && [ -n "${INDEXER_PASS:-}" ] || { echo "CHYBÍ env INDEXER_USER / INDEXER_PASS" >&2; exit 1; }
+[ -n "${INDEXER_API_KEY:-}" ] || { [ -n "${INDEXER_USER:-}" ] && [ -n "${INDEXER_PASS:-}" ]; } || { echo "CHYBÍ env INDEXER_API_KEY (nebo INDEXER_USER + INDEXER_PASS)" >&2; exit 1; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
@@ -111,21 +117,37 @@ log_unknown() {
   done
 }
 
-# ---- Login -> token ----
+# ---- Přihlášení: klíč X-Api-Key, jinak login -> token ----
+# AUTH = hlavička pro všechny dotazy na indexer (pole, ať se dá rozbalit "${AUTH[@]}")
+AUTH=()
 login() {
+  if [ -n "${INDEXER_API_KEY:-}" ]; then
+    AUTH=(-H "X-Api-Key: $INDEXER_API_KEY")
+    log "Indexer: klíč X-Api-Key"
+    return
+  fi
   local resp
   resp=$(curl -s -m 15 -X POST "$INDEXER_URL/api/login" \
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg u "$INDEXER_USER" --arg p "$INDEXER_PASS" '{username:$u,password:$p}')")
   TOKEN=$(echo "$resp" | jq -r '.token // empty')
   [ -n "$TOKEN" ] || { echo "Login selhal: $resp" >&2; exit 1; }
+  AUTH=(-H "Authorization: Bearer $TOKEN")
   log "Login OK (token ${#TOKEN} znaků)"
+}
+# odpověď 401 z indexeru: s tokenem znovu přihlásit, se špatným klíčem skončit (jinak by se smyčka točila)
+relogin() {
+  if [ -n "${INDEXER_API_KEY:-}" ]; then
+    log "Indexer odmítl klíč X-Api-Key (401) — zkontroluj INDEXER_API_KEY. Konec."
+    exit 1
+  fi
+  login
 }
 
 # ---- TorBox helpery ----
-tb_checkcached() {  # arg: comma-separated hashes -> JSON data objekt
-  curl -s -m 15 "$TORBOX_API/torrents/checkcached?hash=$1&format=object" \
-    -H "Authorization: Bearer $TORBOX_API_KEY" | jq -c '.data // {}'
+tb_checkcached() {  # arg: comma-separated hashes -> celá odpověď TorBoxu (success/data kontroluje volající)
+  curl -s -m 30 "$TORBOX_API/torrents/checkcached?hash=$1&format=object" \
+    -H "Authorization: Bearer $TORBOX_API_KEY"
 }
 tb_add() {          # arg: hash -> torrent_id | prázdno
   curl -s -m 20 -X POST "$TORBOX_API/torrents/createtorrent" \
@@ -145,7 +167,18 @@ tb_delete() {       # arg: torrent_id
     -H "Authorization: Bearer $TORBOX_API_KEY" \
     -H "Content-Type: application/json" \
     -d "{\"torrent_id\":$1,\"operation\":\"delete\"}" >/dev/null 2>&1
+  if [ "$1" = "${CURRENT_TID:-}" ]; then CURRENT_TID=""; fi
 }
+# torrent přidaný do TorBox účtu, který ještě není smazaný — při pádu / ukončení ho smaže trap
+CURRENT_TID=""
+cleanup() {
+  if [ -n "${CURRENT_TID:-}" ]; then
+    log "Úklid: mažu z TorBoxu rozdělaný torrent $CURRENT_TID"
+    tb_delete "$CURRENT_TID"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # ---- Výběr souboru z TorBox files[] podle indexer hintu ----
 # Priorita: 1) basename(short_name)==basename(hint) 2) přesná size
@@ -337,11 +370,13 @@ post_results() {
   payload=$(jq -s '{
     results: [ .[] | {
       id: .id,
-      # status může nést podtyp (error:curl, error:magic-zip…) — pro endpoint
-      # se bere jen část před dvojtečkou; podtyp slouží jen k diagnostice v logu
-      status: ( (.status | split(":")[0]) as $s
-                | { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
-                    "zip":"no_data", "uncached":"uncached", "error":"uncached" }[$s] // "uncached" ),
+      # status může nést podtyp (error:curl, error:magic-zip…). Trvalé chyby souboru (zip / jiný
+      # formát než video = error:magic-*, prázdný soubor) -> no_data hned; přechodné (stažení,
+      # createtorrent, requestdl, mkvmerge/ffprobe) -> uncached = zkusí se znovu jindy
+      status: ( .status as $full | ($full | split(":")[0]) as $s
+                | if $s == "error" and ($full | test("^error:(magic-|empty-file)")) then "no_data"
+                  else { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
+                         "zip":"no_data", "uncached":"uncached", "error":"uncached" }[$s] // "uncached" end ),
       subtitle_langs: (.subtitle_langs | join(",")),
       audio_langs:    (.audio_langs    | join(","))
     }
@@ -355,16 +390,16 @@ post_results() {
 
   local resp
   resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
-    -H "Authorization: Bearer $TOKEN" \
+    "${AUTH[@]}" \
     -H "Content-Type: application/json" \
     -d "$payload")
 
-  # 401 -> token expiroval -> re-login a zkus POST znovu
+  # 401 -> token expiroval -> re-login a zkus POST znovu (se špatným klíčem relogin skončí)
   if echo "$resp" | jq -e '.needLogin // (.error=="Unauthorized")' >/dev/null 2>&1; then
     log "POST: token expiroval — re-login a retry."
-    login
+    relogin
     resp=$(curl -s -m 60 -X POST "$INDEXER_URL/api/admin/lang-probe/result" \
-      -H "Authorization: Bearer $TOKEN" \
+      "${AUTH[@]}" \
       -H "Content-Type: application/json" \
       -d "$payload")
   fi
@@ -389,22 +424,34 @@ run_probe() {
     # --- dávka z indexeru (endpoint sám řadí: neprobnuté první, uncached potom) ---
     local batch n
     batch=$(curl -s -m 20 "$INDEXER_URL/api/admin/lang-probe/batch?limit=$BATCH_SIZE" \
-      -H "Authorization: Bearer $TOKEN")
+      "${AUTH[@]}")
 
-    # 401 -> token expiroval -> re-login a zkus dávku znovu
+    # 401 -> token expiroval -> re-login a zkus dávku znovu (se špatným klíčem relogin skončí)
     if echo "$batch" | jq -e '.needLogin // (.error=="Unauthorized")' >/dev/null 2>&1; then
-      log "Token expiroval — re-login."
-      login
+      [ -n "${INDEXER_API_KEY:-}" ] || log "Token expiroval — re-login."
+      relogin
       continue
     fi
 
-    n=$(echo "$batch" | jq '.items | length' 2>/dev/null || echo 0)
+    # indexer nedostupný / neplatná odpověď ≠ prázdná fronta
+    if ! echo "$batch" | jq -e '.items | type == "array"' >/dev/null 2>&1; then
+      log "Indexer nevrátil dávku (nedostupný nebo chyba) — konec běhu. Odpověď: $(echo "$batch" | head -c 300)"
+      return 1
+    fi
+    n=$(echo "$batch" | jq '.items | length')
     [ "$n" -gt 0 ] || { log "Fronta prázdná (done) — konec."; return 0; }
 
     # --- hromadný checkcached na celou dávku ---
-    local hashes cached
+    # Výpadek / chyba TorBoxu (bez success:true) = konec běhu: jinak by se celá dávka nahlásila
+    # jako uncached a torrenty by zbytečně přišly o pokus.
+    local hashes cached cc_raw
     hashes=$(echo "$batch" | jq -r '[.items[].infohash] | join(",")')
-    cached=$(tb_checkcached "$hashes")
+    cc_raw=$(tb_checkcached "$hashes")
+    if ! echo "$cc_raw" | jq -e '.success == true' >/dev/null 2>&1; then
+      log "TorBox checkcached selhal — konec běhu, dávka se nehlásí. Odpověď: $(echo "$cc_raw" | head -c 300)"
+      return 1
+    fi
+    cached=$(echo "$cc_raw" | jq -c '.data // {}')
 
     # --- iterace přes položky ---
     local count i
@@ -437,8 +484,9 @@ run_probe() {
         processed=$((processed+1)); continue
       fi
 
-      # přidat torrent -> id
+      # přidat torrent -> id (CURRENT_TID: při pádu ho smaže trap)
       tid=$(tb_add "$hash")
+      [ -n "$tid" ] && CURRENT_TID="$tid"
       if [ -z "$tid" ]; then
         log "  #$id createtorrent selhal — skip"
         emit "$id" "$hash" "error" "" "" "$hname"
@@ -503,9 +551,12 @@ run_probe() {
   return 0
 }
 
-run_probe
+# návratový kód: 0 = hotovo / strop / prázdná fronta, 1 = indexer nebo TorBox selhal (vidět v logu cronu)
+rc=0
+run_probe || rc=$?
 
-log "Hotovo — zpracováno celkem $processed, výstup: $OUT"
+log "Hotovo — zpracováno celkem $processed, výstup: $OUT$([ "$rc" -ne 0 ] && echo " (běh přerušen chybou)")"
+exit "$rc"
 
 
 # POST se dělá po KAŽDÉ dávce uvnitř run_probe (viz post_results tam),
