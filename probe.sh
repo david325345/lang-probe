@@ -29,6 +29,7 @@ BATCH_SIZE="${PROBE_BATCH_SIZE:-50}" # kolik si vzít z indexeru na dávku
 SLEEP_BETWEEN="${PROBE_SLEEP:-20}"   # rozestup mezi torrenty (s)
 RANGE_BYTES="${PROBE_RANGE:-524287}"       # 512 KB - 1 (základní pokus)
 RANGE_RETRY="${PROBE_RANGE_RETRY:-8388607}" # 8 MB - 1 (retry: mkvmerge čte i attachments/fonty, u releasů s hodně fonty se na 2 MB utne uprostřed JSONu)
+RANGE_RETRY2="${PROBE_RANGE_RETRY2:-33554431}" # 32 MB - 1 (3. pokus: releasy s desítkami MB fontů; 3–4 za noc selhaly i na 8 MB)
 OUT="${PROBE_OUT:-/tmp/results.jsonl}"
 BATCH_OUT="/tmp/batch_results.jsonl"   # výsledky jen aktuální dávky (POST po dávce)
 TMP="/tmp/probe_work.bin"
@@ -222,14 +223,15 @@ pick_file() {
 # Vrací status na stdout: "ok|SUBS|AUDIO" / "empty|..." / "error:<duvod>||"
 # Důvody: curl (stažení selhalo), empty-file (0 B), magic-<hex> (není MKV),
 #         mkv-noout (mkvmerge nic nevrátil), mkv-badjson (neúplný JSON)
-# DVA POKUSY: základ RANGE_BYTES (512 KB), a když mkvmerge nedá validní JSON
-# (Tracks se do rozsahu nevešel), zopakuje se s RANGE_RETRY (2 MB).
+# TŘI POKUSY: základ RANGE_BYTES (512 KB), a když mkvmerge nedá validní JSON
+# (Tracks / fonty se do rozsahu nevešly), RANGE_RETRY (8 MB) a pak RANGE_RETRY2 (32 MB).
+# Selže-li i třetí, je chyba trvalá (mkv-noout / mkv-badjson → no_data, znovu se nezkouší).
 probe_mkv() {
   local url="$1"
   local attempt=1 range="$RANGE_BYTES" j=""
 
   while :; do
-    if ! curl -s -m 60 -r "0-$range" -o "$TMP" "$url"; then
+    if ! curl -s -m 120 -r "0-$range" -o "$TMP" "$url"; then
       echo "error:curl||"; return
     fi
 
@@ -252,18 +254,18 @@ probe_mkv() {
       break
     fi
 
-    # neúplný/prázdný výstup -> zkus větší rozsah
-    if [ "$attempt" -eq 1 ]; then
-      attempt=2
-      range="$RANGE_RETRY"
+    # neúplný/prázdný výstup -> zkus větší rozsah (soubor menší než rozsah = už je celý, víc nepřibude)
+    if [ "$attempt" -lt 3 ] && [ "$fsize" -gt "$range" ]; then   # curl -r 0-N stáhne N+1 B, když soubor je větší
+      attempt=$((attempt + 1))
+      if [ "$attempt" -eq 2 ]; then range="$RANGE_RETRY"; else range="$RANGE_RETRY2"; fi
       # POZOR: uvnitř probe_mkv jde log na STDERR — stdout nese návratovou
       # hodnotu funkce ("ok|subs|audio"), takže zápis na stdout by ji rozbil.
-      log "    retry s $(( (RANGE_RETRY+1)/1024 )) KB (1. pokus nedal validní JSON)" >&2
+      log "    retry s $(( (range+1)/1024 )) KB ($((attempt - 1)). pokus nedal validní JSON)" >&2
       continue
     fi
 
-    # ani druhý pokus nepomohl — zaloguj, co mkvmerge reálně říká
-    log "    selhalo i na 2. pokus (staženo $fsize B)" >&2
+    # ani poslední pokus nepomohl — zaloguj, co mkvmerge reálně říká
+    log "    selhalo i na $attempt. pokus (staženo $fsize B) — trvalá chyba, znovu se nezkouší" >&2
     local errmsg; errmsg=$(head -c 300 /tmp/mkvmerge_err.txt 2>/dev/null | tr '\n' ' ')
     [ -n "$errmsg" ] && log "    mkvmerge stderr: $errmsg" >&2
     # a kus výstupu, když vůbec něco vrátil (ukáže, kde se JSON utnul)
@@ -371,10 +373,10 @@ post_results() {
     results: [ .[] | {
       id: .id,
       # status může nést podtyp (error:curl, error:magic-zip…). Trvalé chyby souboru (zip / jiný
-      # formát než video = error:magic-*, prázdný soubor) -> no_data hned; přechodné (stažení,
-      # createtorrent, requestdl, mkvmerge/ffprobe) -> uncached = zkusí se znovu jindy
+      # formát než video = error:magic-*, prázdný soubor, mkvmerge selhal i na 32 MB = error:mkv-*)
+      # -> no_data hned; přechodné (stažení, createtorrent, requestdl, ffprobe) -> uncached = zkusí se znovu jindy
       status: ( .status as $full | ($full | split(":")[0]) as $s
-                | if $s == "error" and ($full | test("^error:(magic-|empty-file)")) then "no_data"
+                | if $s == "error" and ($full | test("^error:(magic-|empty-file|mkv-)")) then "no_data"
                   else { "ok":"cached", "empty":"no_data", "nonmkv":"no_data",
                          "zip":"no_data", "uncached":"uncached", "error":"uncached" }[$s] // "uncached" end ),
       subtitle_langs: (.subtitle_langs | join(",")),
