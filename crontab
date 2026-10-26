@@ -1,7 +1,8 @@
 # NimeToDex lang-probe — noční běh
 # Kontejner běží v TZ=Europe/Prague (viz Dockerfile), takže tento čas
-# je PRAŽSKÝ. Spustí se v 1:00 v noci, doběhne max 150 torrentů
-# (~50 min při 20s rozestupu), vejde se do okna 1:00-6:00.
+# je PRAŽSKÝ. Spustí se v 1:00 v noci, probne max 150 torrentů v cache TorBoxu
+# (~50–60 min při 20s rozestupu; necachované se jen zkontrolují a do stropu
+# se nepočítají), vejde se do okna 1:00-6:00.
 # Env proměnné cron nevidí — entrypoint je uloží do /app/env.sh.
 #
 # min hod den měsíc den-v-týdnu  uživatel  příkaz

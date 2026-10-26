@@ -24,7 +24,10 @@ set -uo pipefail
 # ---- Konfigurace (env s rozumnými defaulty) ----
 INDEXER_URL="${INDEXER_URL:-http://indexer:3003}"
 TORBOX_API="${TORBOX_API:-https://api.torbox.app/v1/api}"
-LIMIT="${PROBE_LIMIT:-150}"          # max torrentů za běh (strop /noc)
+LIMIT="${PROBE_LIMIT:-150}"          # max PROBNUTÝCH torrentů za běh (přidaných do TorBoxu, strop /noc)
+# Necachované / ne-MKV se jen zkontrolují (hromadný checkcached, bez TorBoxu a bez pauzy) a do stropu
+# se nepočítají — dřív zabraly 40–100 ze 150 míst a skutečně se probovalo jen ~50–80 torrentů za noc.
+MAX_CHECKS="${PROBE_MAX_CHECKS:-1000}"   # pojistka: nejvýš položek za běh včetně necachovaných
 BATCH_SIZE="${PROBE_BATCH_SIZE:-50}" # kolik si vzít z indexeru na dávku
 SLEEP_BETWEEN="${PROBE_SLEEP:-20}"   # rozestup mezi torrenty (s)
 RANGE_BYTES="${PROBE_RANGE:-524287}"       # 512 KB - 1 (základní pokus)
@@ -348,9 +351,10 @@ probe_langs() {
 # =====================================================================
 login
 : > "$OUT"   # vyprázdnit výstup pro tento běh
-log "Start — limit=$LIMIT, batch=$BATCH_SIZE, sleep=${SLEEP_BETWEEN}s, out=$OUT"
+log "Start — limit=$LIMIT probů (nejvýš $MAX_CHECKS položek), batch=$BATCH_SIZE, sleep=${SLEEP_BETWEEN}s, out=$OUT"
 
-processed=0
+processed=0   # všechny položky (i necachované)
+probed=0      # přidané do TorBoxu (strop LIMIT)
 # ---- Zpracování jedné fáze (0 = neprobnuté, 1 = uncached retry) ----
 # Bere torrenty z indexeru pro danou fázi a probíná je, dokud není fáze
 # ---- Odeslání výsledků do indexeru (jeden POST na konci běhu) ----
@@ -420,9 +424,9 @@ post_results() {
 # sám — worker jen bere dávky a probíná, dokud není done nebo nedojde strop.
 # Noční cron: jednorázový běh, doběhne a skončí (žádná pauza/smyčka navíc).
 run_probe() {
-  log "=== Start probe (strop: $LIMIT) ==="
+  log "=== Start probe (strop: $LIMIT probů) ==="
 
-  while [ "$processed" -lt "$LIMIT" ]; do
+  while [ "$probed" -lt "$LIMIT" ] && [ "$processed" -lt "$MAX_CHECKS" ]; do
     # --- dávka z indexeru (endpoint sám řadí: neprobnuté první, uncached potom) ---
     local batch n
     batch=$(curl -s -m 20 "$INDEXER_URL/api/admin/lang-probe/batch?limit=$BATCH_SIZE" \
@@ -460,7 +464,7 @@ run_probe() {
     count=$(echo "$batch" | jq '.items | length')
     i=0
     : > "$BATCH_OUT"   # výsledky jen této dávky (POSTnou se hned po ní)
-    while [ "$i" -lt "$count" ] && [ "$processed" -lt "$LIMIT" ]; do
+    while [ "$i" -lt "$count" ] && [ "$probed" -lt "$LIMIT" ] && [ "$processed" -lt "$MAX_CHECKS" ]; do
       local item id hash hname hsize is_cached tid files picked fid mt sname url res st subs audio
       item=$(echo "$batch" | jq -c ".items[$i]")
       i=$((i+1))
@@ -486,7 +490,8 @@ run_probe() {
         processed=$((processed+1)); continue
       fi
 
-      # přidat torrent -> id (CURRENT_TID: při pádu ho smaže trap)
+      # přidat torrent -> id (CURRENT_TID: při pádu ho smaže trap); od tady se položka počítá do stropu
+      probed=$((probed+1))
       tid=$(tb_add "$hash")
       [ -n "$tid" ] && CURRENT_TID="$tid"
       if [ -z "$tid" ]; then
@@ -536,7 +541,7 @@ run_probe() {
       # úklid + rozestup
       tb_delete "$tid"
       processed=$((processed+1))
-      [ "$processed" -lt "$LIMIT" ] && sleep "$SLEEP_BETWEEN"
+      [ "$probed" -lt "$LIMIT" ] && sleep "$SLEEP_BETWEEN"
     done
 
     # POST výsledků TÉTO dávky hned — indexer tím ví, co je hotové, a další
@@ -549,7 +554,7 @@ run_probe() {
     [ "$done_flag" = "true" ] && { log "done=true — fronta hotová."; return 0; }
   done
 
-  log "Dosažen strop $LIMIT."
+  if [ "$probed" -ge "$LIMIT" ]; then log "Dosažen strop $LIMIT probů."; else log "Dosažena pojistka $MAX_CHECKS položek."; fi
   return 0
 }
 
@@ -557,7 +562,7 @@ run_probe() {
 rc=0
 run_probe || rc=$?
 
-log "Hotovo — zpracováno celkem $processed, výstup: $OUT$([ "$rc" -ne 0 ] && echo " (běh přerušen chybou)")"
+log "Hotovo — zpracováno celkem $processed, z toho probnuto $probed, výstup: $OUT$([ "$rc" -ne 0 ] && echo " (běh přerušen chybou)")"
 exit "$rc"
 
 
